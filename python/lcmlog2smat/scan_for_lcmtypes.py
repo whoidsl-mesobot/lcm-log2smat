@@ -4,109 +4,100 @@ import os
 import sys
 import pyclbr
 from io import open
+from typing import List, Dict, Type
 
-def find_lcmtypes():
-    alpha_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    valid_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
-    lcmtypes = []
-    regex = re.compile("_get_packed_fingerprint")
-    
-    dirs_to_check = sys.path
 
-    for dir_name in dirs_to_check:
-        for root, dirs, files in os.walk(dir_name):
-            subdirs = root[len(dir_name):].split(os.sep)
-            subdirs = [ s for s in subdirs if s ]
+def find_lcmtypes(root_path: str) -> List[str]:
+    """
+        Scans every subdirectory of root_path searching for lcm-types
+    """
+    filename_validator = re.compile(r"[a-zA-Z][a-zA-Z0-9_]*\.py")
+    file_validator = re.compile("_get_packed_fingerprint")
 
-            python_package = ".".join(subdirs)
+    found_lcmtypes: List[str] = []
 
-            for fname in files:
-                if not fname.endswith(".py"):
-                    continue
-                
-                mod_basename = fname[:-3]
-                valid_modname = True
-                for c in mod_basename:
-                    if c not in valid_chars:
-                        valid_modname = False
-                        break
-                if mod_basename[0] not in alpha_chars:
-                    valid_modname = False
-                if not valid_modname:
-                    continue
+    print("SCANNING FOR LCM TYPES".format(root_path))
+    for root, dirs, files in os.walk(root_path):
+        print("Searching directory {}".format(root))
 
-                # quick regex test -- check if the file contains the 
-                # word "_get_packed_fingerprint"
-                full_fname = os.path.join(root, fname)
-                try: 
-                    contents = open(full_fname, "r", encoding='latin1').read()
-                    # contents = open(full_fname, "r").read()
-                except IOError:
-                    continue
-                if not regex.search(contents):
-                    continue
-                
-                # More thorough check to see if the file corresponds to a
-                # LCM type module genereated by lcm-gen.  Parse the 
-                # file using pyclbr, and check if it contains a class
-                # with the right name and methods
-                if python_package:
-                    modname = "%s.%s" % (python_package, mod_basename)
-                else:
-                    modname = mod_basename
-                try:
-                    klass = pyclbr.readmodule(modname)[mod_basename]
-                    if "decode" in klass.methods and \
-                       "_get_packed_fingerprint" in klass.methods:
+        # The python package will be the relative path to the file
+        python_package = os.path.relpath(root, root_path).replace(os.sep, ".")
 
-                        lcmtypes.append(modname)
-                except ImportError:
-                    continue
-                except KeyError:
-                    continue
+        for file in files:
+            # Ensure file name (and hence lcm-type name) is importable to matlab
+            if not filename_validator.fullmatch(file):
+                continue
 
-            # only recurse into subdirectories that correspond to python 
-            # packages (i.e., they contain a file named "__init__.py")
-            subdirs_to_traverse = [ subdir_name for subdir_name in dirs \
-                    if os.path.exists(os.path.join(root, subdir_name, "__init__.py")) ]
-            del dirs[:]
-            dirs.extend(subdirs_to_traverse)
-    return lcmtypes
+            lcmtype_name = file[:-3]
 
-def make_lcmtype_dictionary():
+            # quick-test -- check if the file contains the required `_get_packed_fingerprint` method
+            try:
+                with open(os.path.join(root, file), "r") as f:
+                    if not file_validator.search(f.read()):
+                        continue
+            except IOError:
+                continue
+
+            # More thorough check to see if the file corresponds to a
+            # LCM type module genereated by lcm-gen.  Parse the
+            # file using pyclbr, and check if it contains a class
+            # with the right name and methods
+            if python_package:
+                module_name = f"{python_package}.{lcmtype_name}"
+            else:
+                module_name = lcmtype_name
+            try:
+                klass = pyclbr.readmodule(module_name)[lcmtype_name]
+                if "decode" in klass.methods and "_get_packed_fingerprint" in klass.methods:
+                    found_lcmtypes.append(module_name)
+            except (ImportError, KeyError):
+                continue
+
+    # Raise error if no lcm type definitions found (nothing will be decoded)
+    if not found_lcmtypes:
+        raise FileNotFoundError("No lcm type definitions found")
+    return found_lcmtypes
+
+
+def make_lcmtype_dictionary(root_path: str) -> Dict[bytes, Type]:
     """Create a dictionary of LCM types keyed by fingerprint.
 
-    Searches the specified python package directories for modules 
+    Searches the specified python package directories for modules
     corresponding to LCM types, imports all the discovered types into the
     global namespace, and returns a dictionary mapping packed fingerprints
     to LCM type classes.
 
-    The primary use for this dictionary is to automatically identify and 
+    The primary use for this dictionary is to automatically identify and
     decode an LCM message.
 
     """
-    lcmtypes = find_lcmtypes()
+    lcm_types = find_lcmtypes(root_path)
+    print(f"Found {len(lcm_types)} lcm types")
 
-    result = {}
+    result: Dict[bytes, Type] = {}
 
-    for lcmtype_name in lcmtypes:
+    for lcm_type in lcm_types:
+        print(lcm_type)
         try:
-            __import__(lcmtype_name)
-            mod = sys.modules[lcmtype_name]
-            type_basename = lcmtype_name.split(".")[-1]
+            __import__(lcm_type)
+            mod = sys.modules[lcm_type]
+            type_basename = lcm_type.split(".")[-1]
             klass = getattr(mod, type_basename)
             fingerprint = klass._get_packed_fingerprint()
             result[fingerprint] = klass
-            #print "importing %s" % lcmtype_name
-        except:
-            print("Error importing %s" % lcmtype_name)
+        except Exception as error:
+            print("Error importing %s" % lcm_type)
+            raise error
     return result
- 
+
+
 if __name__ == "__main__":
     import binascii
+
     print("Searching for LCM types...")
-    lcmtypes = make_lcmtype_dictionary()
+    sys.path.insert(0, "/Users/cailean/Dropbox/whoi/mesobot/lcm_types/Generated/python")
+    lcmtypes = make_lcmtype_dictionary("/Users/cailean/Dropbox/whoi/mesobot/lcm_types/Generated/python")
     num_types = len(lcmtypes)
-    print("Found %d type%s" % (num_types, num_types==1 and "" or "s"))
+    print("Found %d type%s" % (num_types, num_types == 1 and "" or "s"))
     for fingerprint, klass in lcmtypes.items():
         print(binascii.hexlify(fingerprint), klass.__module__)
